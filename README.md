@@ -1,2 +1,2 @@
 # genomic-variant-explorer
-This project is about developing a structured pipeline for loading, filtering, analyzing, and visualizing genomic variants.
+This project is highly relevant because it addresses a core challenge in modern genomics: making sense of large-scale genetic variation data. Variant Call Format (VCF) files are essential in fields such as medical genetics, population genomics, precision medicine, and evolutionary biology, yet they are often difficult to explore without computational tools. By developing a structured pipeline for loading, filtering, analyzing, and visualizing genomic variants.

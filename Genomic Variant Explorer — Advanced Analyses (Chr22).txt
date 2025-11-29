@@ -1,0 +1,296 @@
+# ------------------------------
+# Colab / Jupyter Notebook
+# Genomic Variant Explorer — Advanced Analyses (Chr22)
+# ------------------------------
+
+# === Cell 0: Install dependencies ===
+# Run once at top of notebook
+!pip install --quiet cyvcf2 scikit-allel==1.3.5 zarr numcodecs joblib
+!pip install --quiet matplotlib seaborn pandas numpy scipy scikit-learn
+
+# (scikit-allel version pinned for API stability in this notebook)
+
+# === Cell 1: Imports ===
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import allel
+from cyvcf2 import VCF
+from scipy.stats import chi2
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import joblib
+import math
+
+plt.style.use('seaborn-whitegrid')
+
+# === Cell 2: Download chromosome 22 VCF (if not already present) ===
+# Use NCBI/1000 Genomes mirror (works in Colab)
+vcf_gz = "chr22.vcf.gz"
+if not os.path.exists(vcf_gz):
+    !wget -O chr22.vcf.gz "https://ftp.ncbi.nlm.nih.gov/1000genomes/ftp/release/20130502/ALL.chr22.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes.vcf.gz"
+    # index file sometimes useful (tabix .tbi)
+    !wget -O chr22.vcf.gz.tbi "https://ftp.ncbi.nlm.nih.gov/1000genomes/ftp/release/20130502/ALL.chr22.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes.vcf.gz.tbi"
+
+!ls -lh chr22.vcf.gz || true
+
+# === Cell 3: Quick check of file size and first lines ===
+!zcat -f chr22.vcf.gz | head -n 20
+
+# === Cell 4: Load VCF metadata and basic tables using cyvcf2 (fast) ===
+vcf = VCF('chr22.vcf.gz')   # cyvcf2 handles gz directly
+samples = vcf.samples
+print("Number of samples:", len(samples))
+print("Example samples (first 10):", samples[:10])
+
+# === Cell 5: Create a lightweight DataFrame of variant-level info (positions, REF, ALT, QUAL, INFO fields) ===
+# We'll iterate and collect only biallelic SNPs to keep memory low.
+positions = []
+refs = []
+alts = []
+quals = []
+infos = []
+ids = []
+
+max_variants_to_scan = 5000000  # safety cap for loop (should finish)
+count = 0
+
+for rec in vcf:
+    count += 1
+    # keep only biallelic SNPs (REF len 1, ALT len 1 and not symbolic)
+    if len(rec.REF) == 1 and len(rec.ALT) == 1 and rec.ALT[0] is not None and len(rec.ALT[0]) == 1:
+        positions.append(rec.POS)
+        refs.append(rec.REF)
+        alts.append(rec.ALT[0])
+        quals.append(rec.QUAL)
+        infos.append(rec.INFO)
+        ids.append(rec.ID)
+    if count % 200000 == 0:
+        print("Scanned", count, "variants...")
+    if count >= max_variants_to_scan:
+        break
+
+print("Collected biallelic SNPs:", len(positions))
+
+df_vars = pd.DataFrame({
+    "CHROM": "22",
+    "POS": positions,
+    "ID": ids,
+    "REF": refs,
+    "ALT": alts,
+    "QUAL": quals,
+    "INFO": infos
+})
+df_vars.head()
+
+# === Cell 6: Parse INFO for AF (allele frequency) and DP if present ===
+# INFO strings are like "AF=0.123;AN=...;..."
+df_vars['AF'] = df_vars['INFO'].str.extract(r"AF=([0-9\.eE-]+)", expand=False).astype(float)
+df_vars['DP'] = df_vars['INFO'].str.extract(r"DP=([0-9]+)", expand=False).astype(float)
+df_vars['QUAL'] = pd.to_numeric(df_vars['QUAL'], errors='coerce')
+
+df_vars[['POS','ID','REF','ALT','AF','DP','QUAL']].head()
+
+# === Cell 7: Filter: basic QC & MAF threshold ===
+# Keep variants with QUAL >= 30 (if QUAL present) and AF not NaN
+df_qc = df_vars.copy()
+df_qc = df_qc[(df_qc['QUAL'].isna()) | (df_qc['QUAL'] >= 30)]  # if QUAL missing, keep; else require >=30
+df_qc = df_qc[df_qc['AF'].notna()]  # for downstream MAF/hwe/PCA we want AF present
+print("After QC and AF filter:", len(df_qc))
+
+# If dataset still too large for PCA/LD, randomly sample N variants
+MAX_SNPS_FOR_HEAVY = 25000   # sensible default for PCA/LD in Colab
+if len(df_qc) > MAX_SNPS_FOR_HEAVY:
+    df_qc_sample = df_qc.sample(n=MAX_SNPS_FOR_HEAVY, random_state=42).sort_values('POS')
+    print("Subsampled to", len(df_qc_sample), "SNPs for heavy analyses (PCA/LD).")
+else:
+    df_qc_sample = df_qc.copy()
+
+# Save list of positions to extract genotype matrix
+positions_to_extract = df_qc_sample['POS'].values
+positions_to_extract[:5]
+
+# === Cell 8: Extract genotype matrix for sampled SNPs using scikit-allel fast path ===
+# We'll use allel.read_vcf with a region or variant id list; scikit-allel can accept a 'samples' list but it's easier to use cyvcf2 to extract genotypes
+from cyvcf2 import VCF
+vcf_for_geno = VCF('chr22.vcf.gz')
+
+# Build a map from position to index for faster lookup
+pos_set = set(positions_to_extract.tolist())
+geno_positions = []
+geno_gts = []  # will be shape (n_variants, n_samples, ploidy)
+selected_count = 0
+
+# iterate VCF once and collect genotype arrays only for chosen positions
+for rec in vcf_for_geno:
+    if rec.POS in pos_set:
+        g = rec.genotypes  # list of [allele1, allele2, phased_flag] per sample
+        # convert to allele counts (0,1,2) and treat missing as -1
+        # rec.genotypes returns list of tuples; we convert to n_alt count
+        n_alt = []
+        for gt in g:
+            a1, a2, phased = gt[0], gt[1], gt[2] if len(gt) > 2 else False
+            if a1 is None or a2 is None or a1 == -1 or a2 == -1:
+                n_alt.append(np.nan)
+            else:
+                n_alt.append((1 if a1 != 0 else 0) + (1 if a2 != 0 else 0))
+        geno_positions.append(rec.POS)
+        geno_gts.append(n_alt)
+        selected_count += 1
+        if selected_count % 2000 == 0:
+            print("Collected genotypes for", selected_count, "SNPs")
+    if selected_count >= len(positions_to_extract):
+        break
+
+print("Collected genotype arrays for", len(geno_positions), "SNPs across", len(samples), "samples.")
+
+# Convert to numpy array: shape (n_variants, n_samples)
+gmat = np.array(geno_gts)  # may contain nan for missing genotypes
+print("Genotype matrix shape:", gmat.shape)
+
+# === Cell 9: Compute MAF per SNP from genotype matrix ===
+# convert n_alt counts to allele frequencies (ignoring NaNs)
+allele_counts = np.nansum(gmat, axis=1)  # sum of alt alleles
+allele_nonmissing = 2 * np.sum(~np.isnan(gmat), axis=1)  # total called alleles per SNP
+maf = allele_counts / allele_nonmissing
+# minor allele freq
+maf = np.where(maf > 0.5, 1 - maf, maf)
+df_qc_sample = df_qc_sample.set_index('POS').loc[geno_positions].reset_index()
+df_qc_sample['MAF_calc'] = maf
+df_qc_sample['MAF_calc'].describe()
+
+# === Cell 10: Hardy-Weinberg Equilibrium test per SNP (chi-square) ===
+# For each SNP compute observed genotype counts: nAA, nAB, nBB
+from scipy.stats import chi2 as chi2dist
+
+hwe_pvals = []
+hwe_chi2s = []
+for i in range(gmat.shape[0]):
+    gt = gmat[i, :]
+    # drop NaNs
+    gt_nonmiss = gt[~np.isnan(gt)]
+    n = len(gt_nonmiss)
+    if n == 0:
+        hwe_pvals.append(np.nan)
+        hwe_chi2s.append(np.nan)
+        continue
+    # count genotypes
+    nAA = np.sum(gt_nonmiss == 0)
+    nAB = np.sum(gt_nonmiss == 1)
+    nBB = np.sum(gt_nonmiss == 2)
+    # allele freq p (ref) and q (alt)
+    # compute p = (2*nAA + nAB) / (2*n)
+    p = (2*nAA + nAB) / (2*n)
+    q = 1 - p
+    # expected genotype counts under HWE
+    expAA = n * p * p
+    expAB = 2 * n * p * q
+    expBB = n * q * q
+    # avoid zero-expected issues: if any expected < 1, set pval = nan
+    if expAA < 1 or expAB < 1 or expBB < 1:
+        hwe_pvals.append(np.nan)
+        hwe_chi2s.append(np.nan)
+        continue
+    chi2_stat = ((nAA - expAA)**2 / expAA) + ((nAB - expAB)**2 / expAB) + ((nBB - expBB)**2 / expBB)
+    pval = chi2dist.sf(chi2_stat, df=1)
+    hwe_pvals.append(pval)
+    hwe_chi2s.append(chi2_stat)
+
+df_qc_sample['HWE_p'] = hwe_pvals
+df_qc_sample['HWE_chi2'] = hwe_chi2s
+
+df_qc_sample[['POS','MAF_calc','HWE_p']].head()
+
+# === Cell 11: Manhattan-style plot using -log10(HWE p-value) across positions ===
+# Only plot SNPs with non-null HWE p
+df_manh = df_qc_sample.dropna(subset=['HWE_p']).copy()
+df_manh['neglog10_p'] = -np.log10(df_manh['HWE_p'].clip(lower=1e-300))  # avoid log(0)
+
+plt.figure(figsize=(14,5))
+plt.scatter(df_manh['POS'], df_manh['neglog10_p'], s=6, alpha=0.6)
+plt.xlabel("Genomic Position (bp)")
+plt.ylabel("-log10(HWE p-value)")
+plt.title("Manhattan-style plot: HWE p-values across Chromosome 22 (sampled SNPs)")
+plt.show()
+
+# === Cell 12: PCA of genotypes ===
+# For PCA we need samples x variants matrix. Current gmat is variants x samples. We'll transpose.
+# But PCA expects no NaNs; we'll impute missing by mean allele count per SNP (row mean).
+gmat_T = gmat.T  # shape (n_samples, n_variants)
+# impute missing (per SNP column)
+col_means = np.nanmean(gmat_T, axis=0)
+inds = np.where(np.isnan(gmat_T))
+if len(inds[0]) > 0:
+    gmat_T[inds] = np.take(col_means, inds[1])
+
+# standardize features (variants)
+scaler = StandardScaler(with_mean=True, with_std=True)
+# Standardizing for PCA across variants (columns)
+gmat_T_std = scaler.fit_transform(gmat_T)
+
+pca = PCA(n_components=6)
+pcs = pca.fit_transform(gmat_T_std)
+explained = pca.explained_variance_ratio_
+print("Explained variance ratio (PC1..PC6):", explained)
+
+# plot PC1 vs PC2
+plt.figure(figsize=(8,6))
+plt.scatter(pcs[:,0], pcs[:,1], s=10, alpha=0.7)
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.title("PCA of Samples (based on sampled Chr22 SNPs)")
+plt.show()
+
+# === Cell 13: LD analysis (r^2) for a region and heatmap ===
+# We'll focus LD on a subregion to keep compute small: choose a contiguous window of 500 SNPs around median position
+n_ld = 500
+mid_index = len(df_qc_sample)//2
+start = max(0, mid_index - n_ld//2)
+end = start + n_ld
+ld_positions = df_qc_sample['POS'].values[start:end]
+ld_gmat = gmat[start:end, :]  # shape (n_ld, n_samples)
+print("LD matrix region SNPs:", ld_gmat.shape[0])
+
+# compute pairwise r between SNPs using allele counts across samples
+# convert to shape (n_variants, n_samples) with no NaNs (imputed earlier in gmat_T step, but here gmat still has NaNs)
+# Let's compute allele counts matrix VxS with NaN->mean per SNP
+ld_g = ld_gmat.copy()
+# impute per SNP mean
+for i in range(ld_g.shape[0]):
+    row = ld_g[i, :]
+    mask = np.isnan(row)
+    if mask.any():
+        row[mask] = np.nanmean(row)
+    ld_g[i, :] = row
+
+# compute correlation matrix between SNP allele counts
+# r = covariance / (std_i * std_j)
+ld_g_centered = ld_g - ld_g.mean(axis=1, keepdims=True)
+stds = ld_g.std(axis=1, ddof=0)
+# compute r matrix
+r_mat = (ld_g_centered @ ld_g_centered.T) / (ld_g.shape[1] * np.outer(stds, stds))
+# r^2
+r2_mat = r_mat**2
+
+# plot heatmap (subset for visibility if too big)
+plt.figure(figsize=(10,8))
+sns.heatmap(r2_mat, cmap='viridis', cbar_kws={'label': 'r^2'})
+plt.title(f"LD heatmap (r^2) for {ld_g.shape[0]} SNPs (Chr22 region)")
+plt.xlabel("SNP index")
+plt.ylabel("SNP index")
+plt.show()
+
+# === Cell 14: Save outputs (tables/plots) ===
+os.makedirs("results", exist_ok=True)
+df_qc_sample.to_csv("results/chr22_sampled_snps_with_stats.csv", index=False)
+joblib.dump(pcs, "results/chr22_pca_pcs.pkl")
+print("Saved results to results/")
+
+# === Cell 15: Summary outputs for README or report ===
+print("SNPs analyzed (after QC & sampling):", len(df_qc_sample))
+print("PCA shapes: PCs:", pcs.shape)
+print("Saved CSV and PCA objects in /content/results/")
+
+# End of notebook
